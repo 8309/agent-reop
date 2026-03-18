@@ -1,0 +1,9 @@
+name: agentic-portfolio
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - langchain
+      - pydantic>=2
