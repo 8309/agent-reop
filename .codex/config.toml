@@ -1,5 +1,4 @@
-# Shared Codex defaults for this repository.
-# Keep this file safe to commit so other machines inherit the same project behavior.
+# Codex project defaults.
 
 approval_policy = "on-request"
 sandbox_mode = "workspace-write"

@@ -55,11 +55,11 @@ make demo-repoops-langchain-claude
 make demo-repoops-langchain-gemini
 ```
 
-## Cross-Machine Sync
+## Configuration
 
-Codex itself does not sync local folders between computers. Treat Git as the source of truth, and commit the project-level guidance that Codex should share across machines:
+Project-level settings that should stay in version control:
 
-- `AGENTS.md`
-- `environment.yml`
-- `Makefile`
-- `.codex/config.toml`
+- `AGENTS.md` — agent behavior rules
+- `environment.yml` — micromamba environment spec
+- `Makefile` — standard targets
+- `.codex/config.toml` — Codex project defaults

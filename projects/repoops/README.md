@@ -67,7 +67,6 @@ make demo-repoops-langchain-gemini
 
 ## Next Milestones
 
-1. Turn deterministic write proposals into issue-specific edits.
-2. Expand the run artifact set beyond `plan.json`.
-3. Tighten the planner prompts and provider behavior for the local CLI backends.
-4. Add stronger validation around live writes.
+1. Expand the run artifact set beyond `plan.json`.
+2. Tighten validation and approval flow around live writes.
+3. Let LLM providers generate richer edit proposals with real code diffs.
