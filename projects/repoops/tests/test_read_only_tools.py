@@ -2,7 +2,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from repoops.read_only_tools import code_search, collect_repo_context, list_files, read_file
+from repoops.read_only_tools import code_search, collect_repo_context, list_files, read_file, read_file_content
 
 
 class ReadOnlyToolsTest(unittest.TestCase):
@@ -59,3 +59,16 @@ class ReadOnlyToolsTest(unittest.TestCase):
             self.assertIn("README.md", context["file_inventory"])
             self.assertEqual(context["key_file_previews"][0]["path"], "README.md")
             self.assertEqual(context["search_results"][0]["pattern"], "plan.json")
+
+    def test_read_file_content_returns_full_text(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "app.py").write_text("line1\nline2\nline3\n", encoding="utf-8")
+
+            content = read_file_content(root, "app.py")
+            self.assertEqual(content, "line1\nline2\nline3")
+
+    def test_read_file_content_returns_empty_for_missing_file(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            content = read_file_content(temp_dir, "nonexistent.py")
+            self.assertEqual(content, "")

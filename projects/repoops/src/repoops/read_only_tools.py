@@ -78,6 +78,23 @@ def read_file(repo_root: str | Path, relative_path: str, max_lines: int = 20) ->
     }
 
 
+def read_file_content(repo_root: str | Path, relative_path: str, max_lines: int = 200) -> str:
+    """Return the text content of a single file (up to *max_lines*).
+
+    Unlike ``read_file`` which returns a metadata dict, this returns a plain
+    string suitable for embedding directly in an LLM prompt.
+    """
+    root = _resolve_repo_root(repo_root)
+    candidate = (root / relative_path).resolve()
+    candidate.relative_to(root)  # path-traversal guard
+
+    if not candidate.exists() or not candidate.is_file():
+        return ""
+
+    lines = candidate.read_text(encoding="utf-8", errors="replace").splitlines()
+    return "\n".join(lines[:max_lines])
+
+
 def code_search(repo_root: str | Path, pattern: str, max_results: int = 10) -> list[dict[str, object]]:
     root = _resolve_repo_root(repo_root)
     matches: list[dict[str, object]] = []

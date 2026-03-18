@@ -4,6 +4,8 @@ from difflib import unified_diff
 from pathlib import Path
 from typing import TypedDict, cast
 
+from repoops.read_only_tools import read_file_content
+
 
 class PlanStep(TypedDict):
     step_id: str
@@ -127,6 +129,7 @@ def build_edit_proposals(payload: dict[str, object]) -> list[FileEditProposal]:
     if existing:
         return existing
 
+    repo_root = str(payload.get("repo", ""))
     repo_context = _get_repo_context(payload)
     search_results = repo_context.get("search_results", [])
     file_inventory = repo_context.get("file_inventory", [])
@@ -143,23 +146,25 @@ def build_edit_proposals(payload: dict[str, object]) -> list[FileEditProposal]:
             if match["path"] in seen_paths:
                 continue
             seen_paths.add(match["path"])
-            original_snippet = match["line_text"].strip() if match["line_text"] else ""
+            full_content = read_file_content(repo_root, match["path"]) if repo_root else ""
+            original_snippet = full_content if full_content else (match["line_text"].strip() if match["line_text"] else "")
             proposals.append(
                 FileEditProposal(
                     path=match["path"],
                     description=f"[{issue_title}] {criterion}",
                     original_snippet=original_snippet,
-                    proposed_snippet=f"# TODO({issue_title}): {criterion}",
+                    proposed_snippet=f"# TODO({issue_title}): {criterion}\n{original_snippet}" if original_snippet else f"# TODO({issue_title}): {criterion}",
                 )
             )
 
     if not proposals and file_inventory:
         fallback_path = file_inventory[0]
+        full_content = read_file_content(repo_root, fallback_path) if repo_root else ""
         proposals.append(
             FileEditProposal(
                 path=fallback_path,
                 description=f"[{issue_title}] {issue_summary}",
-                original_snippet="",
+                original_snippet=full_content,
                 proposed_snippet=f"# TODO({issue_title}): {issue_summary}",
             )
         )

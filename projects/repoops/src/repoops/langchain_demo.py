@@ -15,9 +15,13 @@ from repoops.claude_code_cli_provider import ClaudeCodeCLIProvider
 from repoops.cli import load_issue_text, persist_run_artifacts
 from repoops.codex_cli_provider import CodexCLIProvider
 from repoops.gemini_cli_provider import GeminiCLIProvider
-from repoops.read_only_tools import collect_repo_context
+from repoops.read_only_tools import collect_repo_context, read_file_content
 from repoops.write_actions import apply_write_action, prepare_write_action
 
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
 
 class PlanStepModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -43,46 +47,44 @@ class PlanDraftModel(BaseModel):
     issue_summary: str = Field(description="Single-sentence summary of the issue")
     acceptance_criteria: list[str] = Field(description="Acceptance criteria copied from the issue")
     plan_outline: list[PlanStepModel] = Field(description="Structured execution plan")
+
+
+class EditPlanModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     edit_proposals: list[FileEditModel] = Field(
-        default_factory=list,
-        description="Proposed file edits derived from the plan and repository context",
+        description="Proposed file edits with original and replacement code snippets",
     )
 
 
-def build_demo_planner_response(issue_text: str, repo_context: dict[str, object] | None = None) -> str:
-    parsed_issue = parse_issue_markdown(issue_text)
-    edit_proposals: list[FileEditModel] = []
+# ---------------------------------------------------------------------------
+# Context helpers
+# ---------------------------------------------------------------------------
 
-    if repo_context:
-        search_results = repo_context.get("search_results", [])
-        criteria = parsed_issue.acceptance_criteria
-        seen: set[str] = set()
-        for criterion in criteria:
-            words = {w.lower() for w in criterion.split() if len(w) > 3}
-            for entry in search_results if isinstance(search_results, list) else []:
-                pattern_lower = entry["pattern"].lower()
-                if any(w in pattern_lower or pattern_lower in w for w in words):
-                    for match in entry["matches"]:
-                        if match["path"] not in seen:
-                            seen.add(match["path"])
-                            edit_proposals.append(FileEditModel(
-                                path=match["path"],
-                                description=f"[{parsed_issue.title}] {criterion}",
-                                original_snippet=match.get("line_text", "").strip(),
-                                proposed_snippet=f"# TODO({parsed_issue.title}): {criterion}",
-                            ))
+def _collect_relevant_paths(repo_context: dict[str, object]) -> list[str]:
+    """Extract unique file paths from search results."""
+    paths: list[str] = []
+    seen: set[str] = set()
+    for entry in repo_context.get("search_results", []):
+        if not isinstance(entry, dict):
+            continue
+        for match in entry.get("matches", []):
+            p = match.get("path", "")
+            if p and p not in seen:
+                seen.add(p)
+                paths.append(p)
+    return paths
 
-    payload = PlanDraftModel(
-        issue_title=parsed_issue.title,
-        issue_summary=parsed_issue.summary,
-        acceptance_criteria=parsed_issue.acceptance_criteria,
-        plan_outline=[
-            PlanStepModel(**step)
-            for step in build_plan_outline(parsed_issue.acceptance_criteria)
-        ],
-        edit_proposals=edit_proposals,
-    )
-    return payload.model_dump_json(indent=2)
+
+def collect_edit_context(repo: str, repo_context: dict[str, object]) -> dict[str, str]:
+    """Read full content of files found in search results so LLM providers
+    have enough context to generate real code edits."""
+    file_contents: dict[str, str] = {}
+    for rel_path in _collect_relevant_paths(repo_context):
+        content = read_file_content(repo, rel_path, max_lines=200)
+        if content:
+            file_contents[rel_path] = content
+    return file_contents
 
 
 def format_repo_context_for_prompt(repo_context: dict[str, object]) -> str:
@@ -114,16 +116,81 @@ def format_repo_context_for_prompt(repo_context: dict[str, object]) -> str:
     return "\n".join(lines).strip()
 
 
+def format_file_contents_for_prompt(file_contents: dict[str, str]) -> str:
+    """Format full file contents for inclusion in the edit prompt."""
+    if not file_contents:
+        return "No file contents available."
+    parts: list[str] = []
+    for path, content in file_contents.items():
+        parts.append(f"### {path}\n```\n{content}\n```")
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic response builders
+# ---------------------------------------------------------------------------
+
+def build_demo_planner_response(issue_text: str) -> str:
+    parsed_issue = parse_issue_markdown(issue_text)
+    payload = PlanDraftModel(
+        issue_title=parsed_issue.title,
+        issue_summary=parsed_issue.summary,
+        acceptance_criteria=parsed_issue.acceptance_criteria,
+        plan_outline=[
+            PlanStepModel(**step)
+            for step in build_plan_outline(parsed_issue.acceptance_criteria)
+        ],
+    )
+    return payload.model_dump_json(indent=2)
+
+
+def build_demo_edit_response(
+    issue_text: str,
+    repo_context: dict[str, object],
+    file_contents: dict[str, str],
+) -> str:
+    """Generate deterministic edit proposals using actual file content."""
+    parsed_issue = parse_issue_markdown(issue_text)
+    proposals: list[FileEditModel] = []
+    search_results = repo_context.get("search_results", [])
+    criteria = parsed_issue.acceptance_criteria
+    seen: set[str] = set()
+
+    for criterion in criteria:
+        words = {w.lower() for w in criterion.split() if len(w) > 3}
+        for entry in search_results if isinstance(search_results, list) else []:
+            pattern_lower = entry["pattern"].lower()
+            if not any(w in pattern_lower or pattern_lower in w for w in words):
+                continue
+            for match in entry["matches"]:
+                path = match["path"]
+                if path in seen:
+                    continue
+                seen.add(path)
+                full_content = file_contents.get(path, "")
+                original_snippet = full_content if full_content else match.get("line_text", "").strip()
+                proposals.append(FileEditModel(
+                    path=path,
+                    description=f"[{parsed_issue.title}] {criterion}",
+                    original_snippet=original_snippet,
+                    proposed_snippet=f"# TODO({parsed_issue.title}): {criterion}\n{original_snippet}",
+                ))
+
+    return EditPlanModel(edit_proposals=proposals).model_dump_json(indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Planner runnables (step 1: plan outline)
+# ---------------------------------------------------------------------------
+
 def build_planner_runnable(
     provider: str,
     repo: str,
     issue_text: str,
-    repo_context: dict[str, object] | None = None,
 ) -> tuple[RunnableLambda, list[str]]:
     if provider == "deterministic":
-        ctx = repo_context
         return (
-            RunnableLambda(lambda _prompt_value: build_demo_planner_response(issue_text, repo_context=ctx)),
+            RunnableLambda(lambda _prompt_value: build_demo_planner_response(issue_text)),
             ["PromptTemplate", "RunnableLambda", "PydanticOutputParser"],
         )
 
@@ -175,38 +242,154 @@ def build_planner_runnable(
     raise ValueError(f"Unsupported provider: {provider}")
 
 
+# ---------------------------------------------------------------------------
+# Edit runnables (step 2: code-level edit proposals)
+# ---------------------------------------------------------------------------
+
+def build_edit_runnable(
+    provider: str,
+    repo: str,
+    issue_text: str,
+    repo_context: dict[str, object],
+    file_contents: dict[str, str],
+) -> tuple[RunnableLambda, list[str]]:
+    if provider == "deterministic":
+        ctx = repo_context
+        fc = file_contents
+        return (
+            RunnableLambda(
+                lambda _pv: build_demo_edit_response(issue_text, repo_context=ctx, file_contents=fc),
+            ),
+            ["EditPromptTemplate", "RunnableLambda", "PydanticOutputParser"],
+        )
+
+    if provider == "codex-cli":
+        codex_provider = CodexCLIProvider(repo)
+
+        def run_codex_edit(prompt_value: object) -> str:
+            prompt_text = prompt_value.to_string() if hasattr(prompt_value, "to_string") else str(prompt_value)
+            return codex_provider.invoke_json(
+                prompt_text=prompt_text,
+                output_schema=EditPlanModel.model_json_schema(),
+            )
+
+        return (
+            RunnableLambda(run_codex_edit),
+            ["EditPromptTemplate", "CodexCLIProvider", "PydanticOutputParser"],
+        )
+
+    if provider == "claude-code-cli":
+        claude_provider = ClaudeCodeCLIProvider(repo)
+
+        def run_claude_edit(prompt_value: object) -> str:
+            prompt_text = prompt_value.to_string() if hasattr(prompt_value, "to_string") else str(prompt_value)
+            return claude_provider.invoke_json(
+                prompt_text=prompt_text,
+                output_schema=EditPlanModel.model_json_schema(),
+            )
+
+        return (
+            RunnableLambda(run_claude_edit),
+            ["EditPromptTemplate", "ClaudeCodeCLIProvider", "PydanticOutputParser"],
+        )
+
+    if provider == "gemini-cli":
+        gemini_provider = GeminiCLIProvider(repo)
+
+        def run_gemini_edit(prompt_value: object) -> str:
+            prompt_text = prompt_value.to_string() if hasattr(prompt_value, "to_string") else str(prompt_value)
+            return gemini_provider.invoke_json(
+                prompt_text=prompt_text,
+                output_schema=EditPlanModel.model_json_schema(),
+            )
+
+        return (
+            RunnableLambda(run_gemini_edit),
+            ["EditPromptTemplate", "GeminiCLIProvider", "PydanticOutputParser"],
+        )
+
+    raise ValueError(f"Unsupported provider: {provider}")
+
+
+# ---------------------------------------------------------------------------
+# Two-step chain: plan → edit proposals
+# ---------------------------------------------------------------------------
+
+PLAN_PROMPT_TEMPLATE = (
+    "You are a RepoOps planning component.\n"
+    "Read the issue below and produce a structured execution plan.\n\n"
+    "Use the repository context below as supporting evidence. Do not run shell commands.\n\n"
+    "Issue:\n{issue_text}\n\n"
+    "Repository context:\n{repo_context}\n\n"
+    "Return JSON that matches this schema:\n{format_instructions}\n"
+)
+
+EDIT_PROMPT_TEMPLATE = (
+    "You are a RepoOps code editor.\n"
+    "Given the issue, plan, and full file contents below, propose concrete code edits.\n\n"
+    "For each file that needs changing:\n"
+    "- Set `path` to the relative file path\n"
+    "- Set `description` to a short explanation of the change\n"
+    "- Set `original_snippet` to the exact lines from the file that need changing\n"
+    "- Set `proposed_snippet` to your replacement code\n\n"
+    "Only include files that actually need changes. Write real, working code.\n\n"
+    "Issue:\n{issue_text}\n\n"
+    "Plan:\n{plan_summary}\n\n"
+    "File contents:\n{file_contents}\n\n"
+    "Return JSON that matches this schema:\n{format_instructions}\n"
+)
+
+
 def build_learning_chain(
     repo: str,
     issue_text: str,
     repo_context: dict[str, object],
     provider: str = "deterministic",
-) -> tuple[str, PlanDraftModel, list[str]]:
-    parser = PydanticOutputParser(pydantic_object=PlanDraftModel)
-    prompt = PromptTemplate.from_template(
-        "You are a RepoOps planning component.\n"
-        "Read the issue below and produce a structured execution plan.\n\n"
-        "Use the repository context below as supporting evidence. Do not run shell commands.\n\n"
-        "For each acceptance criterion, identify the file(s) that need editing and propose\n"
-        "concrete code changes in the edit_proposals list. Include the original snippet\n"
-        "from the file and your proposed replacement.\n\n"
-        "Issue:\n{issue_text}\n\n"
-        "Repository context:\n{repo_context}\n\n"
-        "Return JSON that matches this schema:\n{format_instructions}\n"
-    )
-    prompt_input = {
+) -> tuple[str, PlanDraftModel, list[FileEditModel], list[str]]:
+    """Two-step chain: (1) generate plan, (2) generate code-level edit proposals.
+
+    Returns (prompt_preview, plan_draft, edit_proposals, chain_steps).
+    """
+    # --- Step 1: Plan ---
+    plan_parser = PydanticOutputParser(pydantic_object=PlanDraftModel)
+    plan_prompt = PromptTemplate.from_template(PLAN_PROMPT_TEMPLATE)
+    plan_input = {
         "issue_text": issue_text,
         "repo_context": format_repo_context_for_prompt(repo_context),
-        "format_instructions": parser.get_format_instructions(),
+        "format_instructions": plan_parser.get_format_instructions(),
     }
-    prompt_preview = prompt.invoke(prompt_input).to_string()
+    prompt_preview = plan_prompt.invoke(plan_input).to_string()
 
-    # Swap only the model/provider step so the PromptTemplate and parser stay constant across
-    # deterministic and Codex-backed runs.
     planner_model, chain_steps = build_planner_runnable(
-        provider=provider, repo=repo, issue_text=issue_text, repo_context=repo_context,
+        provider=provider, repo=repo, issue_text=issue_text,
     )
-    chain = prompt | planner_model | parser
-    return prompt_preview, chain.invoke(prompt_input), chain_steps
+    plan_chain = plan_prompt | planner_model | plan_parser
+    plan_draft: PlanDraftModel = plan_chain.invoke(plan_input)
+
+    # --- Step 2: Edit proposals ---
+    file_contents = collect_edit_context(repo, repo_context)
+    plan_summary = "\n".join(
+        f"- {step.step_id}: {step.description}" for step in plan_draft.plan_outline
+    )
+
+    edit_parser = PydanticOutputParser(pydantic_object=EditPlanModel)
+    edit_prompt = PromptTemplate.from_template(EDIT_PROMPT_TEMPLATE)
+    edit_input = {
+        "issue_text": issue_text,
+        "plan_summary": plan_summary,
+        "file_contents": format_file_contents_for_prompt(file_contents),
+        "format_instructions": edit_parser.get_format_instructions(),
+    }
+
+    edit_model, edit_steps = build_edit_runnable(
+        provider=provider, repo=repo, issue_text=issue_text,
+        repo_context=repo_context, file_contents=file_contents,
+    )
+    edit_chain = edit_prompt | edit_model | edit_parser
+    edit_plan: EditPlanModel = edit_chain.invoke(edit_input)
+
+    all_steps = chain_steps + edit_steps
+    return prompt_preview, plan_draft, edit_plan.edit_proposals, all_steps
 
 
 def build_langchain_artifact(
@@ -218,7 +401,7 @@ def build_langchain_artifact(
 ) -> dict[str, object]:
     issue_text = load_issue_text(issue)
     repo_context = collect_repo_context(repo)
-    prompt_preview, plan_draft, chain_steps = build_learning_chain(
+    prompt_preview, plan_draft, edit_proposals, chain_steps = build_learning_chain(
         repo=repo,
         issue_text=issue_text,
         repo_context=repo_context,
@@ -238,8 +421,8 @@ def build_langchain_artifact(
     payload["issue_summary"] = plan_draft.issue_summary
     payload["acceptance_criteria"] = plan_draft.acceptance_criteria
     payload["plan_outline"] = [step.model_dump() for step in plan_draft.plan_outline]
-    if plan_draft.edit_proposals:
-        payload["edit_proposals"] = [ep.model_dump() for ep in plan_draft.edit_proposals]
+    if edit_proposals:
+        payload["edit_proposals"] = [ep.model_dump() for ep in edit_proposals]
     payload["learning_track"] = "langchain-basics"
     payload["provider"] = provider
     payload["chain_steps"] = chain_steps
