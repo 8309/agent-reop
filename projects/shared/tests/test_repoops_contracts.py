@@ -38,3 +38,7 @@ class RepoOpsContractsTest(unittest.TestCase):
         self.assertEqual(payload["run_dir"], f"/tmp/demo-repo/runs/{payload['run_id']}")
         self.assertEqual(payload["persisted_artifacts"], [])
         self.assertEqual(payload["repo_context"], {})
+        self.assertEqual(payload["write_status"], "awaiting-write-proposal")
+        self.assertEqual(payload["edit_proposals"], [])
+        self.assertEqual(payload["write_proposal"], {})
+        self.assertEqual(payload["applied_writes"], [])

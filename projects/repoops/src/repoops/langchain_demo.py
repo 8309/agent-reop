@@ -16,6 +16,7 @@ from repoops.cli import load_issue_text, persist_run_artifacts
 from repoops.codex_cli_provider import CodexCLIProvider
 from repoops.gemini_cli_provider import GeminiCLIProvider
 from repoops.read_only_tools import collect_repo_context
+from repoops.write_actions import apply_write_action, prepare_write_action
 
 
 class PlanStepModel(BaseModel):
@@ -26,6 +27,15 @@ class PlanStepModel(BaseModel):
     status: str = Field(description="Execution status for the step")
 
 
+class FileEditModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(description="Relative path to the file to edit")
+    description: str = Field(description="What change is proposed and why")
+    original_snippet: str = Field(description="Existing code snippet for context (may be empty for new files)")
+    proposed_snippet: str = Field(description="Proposed replacement code snippet")
+
+
 class PlanDraftModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -33,10 +43,35 @@ class PlanDraftModel(BaseModel):
     issue_summary: str = Field(description="Single-sentence summary of the issue")
     acceptance_criteria: list[str] = Field(description="Acceptance criteria copied from the issue")
     plan_outline: list[PlanStepModel] = Field(description="Structured execution plan")
+    edit_proposals: list[FileEditModel] = Field(
+        default_factory=list,
+        description="Proposed file edits derived from the plan and repository context",
+    )
 
 
-def build_demo_planner_response(issue_text: str) -> str:
+def build_demo_planner_response(issue_text: str, repo_context: dict[str, object] | None = None) -> str:
     parsed_issue = parse_issue_markdown(issue_text)
+    edit_proposals: list[FileEditModel] = []
+
+    if repo_context:
+        search_results = repo_context.get("search_results", [])
+        criteria = parsed_issue.acceptance_criteria
+        seen: set[str] = set()
+        for criterion in criteria:
+            words = {w.lower() for w in criterion.split() if len(w) > 3}
+            for entry in search_results if isinstance(search_results, list) else []:
+                pattern_lower = entry["pattern"].lower()
+                if any(w in pattern_lower or pattern_lower in w for w in words):
+                    for match in entry["matches"]:
+                        if match["path"] not in seen:
+                            seen.add(match["path"])
+                            edit_proposals.append(FileEditModel(
+                                path=match["path"],
+                                description=f"[{parsed_issue.title}] {criterion}",
+                                original_snippet=match.get("line_text", "").strip(),
+                                proposed_snippet=f"# TODO({parsed_issue.title}): {criterion}",
+                            ))
+
     payload = PlanDraftModel(
         issue_title=parsed_issue.title,
         issue_summary=parsed_issue.summary,
@@ -45,6 +80,7 @@ def build_demo_planner_response(issue_text: str) -> str:
             PlanStepModel(**step)
             for step in build_plan_outline(parsed_issue.acceptance_criteria)
         ],
+        edit_proposals=edit_proposals,
     )
     return payload.model_dump_json(indent=2)
 
@@ -82,10 +118,12 @@ def build_planner_runnable(
     provider: str,
     repo: str,
     issue_text: str,
+    repo_context: dict[str, object] | None = None,
 ) -> tuple[RunnableLambda, list[str]]:
     if provider == "deterministic":
+        ctx = repo_context
         return (
-            RunnableLambda(lambda _prompt_value: build_demo_planner_response(issue_text)),
+            RunnableLambda(lambda _prompt_value: build_demo_planner_response(issue_text, repo_context=ctx)),
             ["PromptTemplate", "RunnableLambda", "PydanticOutputParser"],
         )
 
@@ -148,6 +186,9 @@ def build_learning_chain(
         "You are a RepoOps planning component.\n"
         "Read the issue below and produce a structured execution plan.\n\n"
         "Use the repository context below as supporting evidence. Do not run shell commands.\n\n"
+        "For each acceptance criterion, identify the file(s) that need editing and propose\n"
+        "concrete code changes in the edit_proposals list. Include the original snippet\n"
+        "from the file and your proposed replacement.\n\n"
         "Issue:\n{issue_text}\n\n"
         "Repository context:\n{repo_context}\n\n"
         "Return JSON that matches this schema:\n{format_instructions}\n"
@@ -161,7 +202,9 @@ def build_learning_chain(
 
     # Swap only the model/provider step so the PromptTemplate and parser stay constant across
     # deterministic and Codex-backed runs.
-    planner_model, chain_steps = build_planner_runnable(provider=provider, repo=repo, issue_text=issue_text)
+    planner_model, chain_steps = build_planner_runnable(
+        provider=provider, repo=repo, issue_text=issue_text, repo_context=repo_context,
+    )
     chain = prompt | planner_model | parser
     return prompt_preview, chain.invoke(prompt_input), chain_steps
 
@@ -195,6 +238,8 @@ def build_langchain_artifact(
     payload["issue_summary"] = plan_draft.issue_summary
     payload["acceptance_criteria"] = plan_draft.acceptance_criteria
     payload["plan_outline"] = [step.model_dump() for step in plan_draft.plan_outline]
+    if plan_draft.edit_proposals:
+        payload["edit_proposals"] = [ep.model_dump() for ep in plan_draft.edit_proposals]
     payload["learning_track"] = "langchain-basics"
     payload["provider"] = provider
     payload["chain_steps"] = chain_steps
@@ -241,6 +286,8 @@ def main(argv: list[str] | None = None) -> int:
         approve_write=args.approve_write,
         provider=args.provider,
     )
+    payload = prepare_write_action(payload)
+    payload = apply_write_action(payload)
     payload = persist_run_artifacts(payload)
     print(json.dumps(payload, indent=2))
     return 0

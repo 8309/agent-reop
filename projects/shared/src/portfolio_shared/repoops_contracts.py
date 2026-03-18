@@ -95,7 +95,11 @@ class RepoOpsRun:
     mode: str
     write_required: bool
     write_approved: bool
+    write_status: str
     repo_context: dict[str, object]
+    edit_proposals: list[dict[str, str]]
+    write_proposal: dict[str, object]
+    applied_writes: list[str]
     artifacts: list[str]
     persisted_artifacts: list[str]
     next_steps: list[str]
@@ -130,15 +134,19 @@ def build_repoops_run(
         mode="dry-run" if dry_run else "live",
         write_required=True,
         write_approved=approve_write,
+        write_status="awaiting-write-proposal",
         repo_context=repo_context or {},
+        edit_proposals=[],
+        write_proposal={},
+        applied_writes=[],
         artifacts=["plan.json", "patch.diff", "test_report.json", "pr_draft.md"],
         # The contract declares expected artifacts first; the CLI fills this list after it writes
         # real files to disk.
         persisted_artifacts=[],
         next_steps=[
-            "Use repo context inside provider-backed planning runs",
-            "Add approval-gated write actions",
             "Expand the run artifact set beyond plan.json",
+            "Tighten validation and approval flow around live writes",
+            "Let LLM providers generate richer edit proposals with real code diffs",
         ],
     )
     return asdict(payload)

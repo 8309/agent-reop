@@ -45,10 +45,13 @@ class RepoOpsLangChainDemoTest(unittest.TestCase):
         )
         self.assertIn("RepoOps planning component", prompt_preview)
         self.assertIn("Repository context:", prompt_preview)
+        self.assertIn("edit_proposals", prompt_preview)
         self.assertIn("README.md", prompt_preview)
         self.assertEqual(plan.issue_title, "Sample Bug")
         self.assertEqual(plan.plan_outline[2].description, "Generate a machine-readable plan")
         self.assertIn("RunnableLambda", chain_steps)
+        self.assertGreater(len(plan.edit_proposals), 0)
+        self.assertIn("cli.py", plan.edit_proposals[0].path)
 
     @patch("repoops.langchain_demo.CodexCLIProvider.invoke_json")
     def test_build_learning_chain_supports_codex_cli_provider(self, mock_invoke_json: object) -> None:

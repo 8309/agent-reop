@@ -21,6 +21,14 @@ The manual `RepoOps` CLI now uses read-only repository tools before it writes `p
 
 The `LangChain` learning demo now receives that same `repo_context` in its prompt, so the manual CLI and provider-backed flow can reason from the same repository evidence.
 
+The workflow now also prepares approval-gated write artifacts:
+
+- `patch.diff`
+- `pr_draft.md`
+- a proposed repo-local handoff file at `repoops-output/repoops-plan.md`
+
+Live writes only happen when you run without `--dry-run` and pass `--approve-write`.
+
 ## Demo
 
 ```bash
@@ -59,7 +67,7 @@ make demo-repoops-langchain-gemini
 
 ## Next Milestones
 
-1. Add approval-gated write actions.
+1. Turn deterministic write proposals into issue-specific edits.
 2. Expand the run artifact set beyond `plan.json`.
 3. Tighten the planner prompts and provider behavior for the local CLI backends.
-4. Start turning repo context into actionable edit proposals.
+4. Add stronger validation around live writes.

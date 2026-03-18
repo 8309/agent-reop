@@ -20,6 +20,9 @@ class RepoOpsSmokeTest(unittest.TestCase):
     def test_persist_run_artifacts_writes_plan_json(self) -> None:
         with TemporaryDirectory() as temp_dir:
             payload = build_artifact(repo=temp_dir, issue=None, dry_run=True, approve_write=False)
+            from repoops.write_actions import prepare_write_action
+
+            payload = prepare_write_action(payload)
             persisted_payload = persist_run_artifacts(payload)
 
             run_dir = Path(str(persisted_payload["run_dir"]))

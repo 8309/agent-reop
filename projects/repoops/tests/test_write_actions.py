@@ -1,0 +1,147 @@
+import json
+from pathlib import Path
+from tempfile import TemporaryDirectory
+import unittest
+
+from repoops.cli import build_artifact, persist_run_artifacts
+from repoops.write_actions import (
+    apply_write_action,
+    build_edit_proposals,
+    prepare_write_action,
+)
+
+
+SAMPLE_ISSUE = """\
+# Sample Bug
+
+The CLI should produce a structured plan before attempting any write action.
+
+Acceptance criteria:
+- Generate a machine-readable plan
+- Keep write actions behind an approval gate
+- Save artifacts for later review
+"""
+
+
+def _make_payload_with_context(temp_dir: str) -> dict[str, object]:
+    """Build a payload against a temp repo that has enough files to trigger edit proposals."""
+    root = Path(temp_dir)
+    (root / "README.md").write_text("# Demo\n\nplan.json appears here.\n", encoding="utf-8")
+    src = root / "projects/repoops/src/repoops"
+    src.mkdir(parents=True)
+    (src / "cli.py").write_text(
+        "def persist_run_artifacts():\n    approve_write = False\n",
+        encoding="utf-8",
+    )
+    issue_path = root / "issue.md"
+    issue_path.write_text(SAMPLE_ISSUE, encoding="utf-8")
+    return build_artifact(repo=temp_dir, issue=str(issue_path), dry_run=True, approve_write=False)
+
+
+class WriteActionsTest(unittest.TestCase):
+    def test_prepare_write_action_adds_proposal(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload = build_artifact(repo=temp_dir, issue=None, dry_run=True, approve_write=False)
+            payload = prepare_write_action(payload)
+
+            self.assertEqual(payload["write_status"], "dry-run-proposed")
+            self.assertEqual(
+                payload["write_proposal"]["target_relative_path"],
+                "repoops-output/repoops-plan.md",
+            )
+            self.assertIn("RepoOps Handoff", payload["write_proposal"]["proposed_content"])
+            self.assertIn("PR Draft", payload["write_proposal"]["pr_draft"])
+
+    def test_apply_write_action_blocks_without_approval(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload = build_artifact(repo=temp_dir, issue=None, dry_run=False, approve_write=False)
+            payload = prepare_write_action(payload)
+            payload = apply_write_action(payload)
+
+            self.assertEqual(payload["write_status"], "blocked-awaiting-approval")
+            self.assertEqual(payload["applied_writes"], [])
+            self.assertFalse((Path(temp_dir) / "repoops-output/repoops-plan.md").exists())
+
+    def test_apply_write_action_writes_target_when_approved(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload = build_artifact(repo=temp_dir, issue=None, dry_run=False, approve_write=True)
+            payload = prepare_write_action(payload)
+            payload = apply_write_action(payload)
+
+            target_path = Path(temp_dir) / "repoops-output/repoops-plan.md"
+            self.assertEqual(payload["write_status"], "applied")
+            self.assertEqual(payload["applied_writes"], [str(target_path.resolve())])
+            self.assertTrue(target_path.exists())
+            self.assertIn("RepoOps Handoff", target_path.read_text(encoding="utf-8"))
+
+    def test_persist_run_artifacts_writes_patch_and_pr_draft(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload = build_artifact(repo=temp_dir, issue=None, dry_run=True, approve_write=False)
+            payload = prepare_write_action(payload)
+            payload = persist_run_artifacts(payload)
+
+            run_dir = Path(str(payload["run_dir"]))
+            patch_path = run_dir / "patch.diff"
+            pr_draft_path = run_dir / "pr_draft.md"
+            plan_path = run_dir / "plan.json"
+
+            self.assertTrue(plan_path.exists())
+            self.assertTrue(patch_path.exists())
+            self.assertTrue(pr_draft_path.exists())
+
+            written_payload = json.loads(plan_path.read_text(encoding="utf-8"))
+            self.assertIn(str(patch_path.resolve()), written_payload["persisted_artifacts"])
+            self.assertIn(str(pr_draft_path.resolve()), written_payload["persisted_artifacts"])
+
+    def test_build_edit_proposals_generates_issue_specific_proposals(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload = _make_payload_with_context(temp_dir)
+            proposals = build_edit_proposals(payload)
+
+            self.assertGreater(len(proposals), 0)
+            paths = [p["path"] for p in proposals]
+            self.assertTrue(any("cli.py" in p for p in paths))
+
+            for proposal in proposals:
+                self.assertIn("path", proposal)
+                self.assertIn("description", proposal)
+                self.assertIn("original_snippet", proposal)
+                self.assertIn("proposed_snippet", proposal)
+
+    def test_edit_proposals_appear_in_handoff_and_pr_draft(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload = _make_payload_with_context(temp_dir)
+            payload = prepare_write_action(payload)
+
+            self.assertIn("edit_proposals", payload)
+            self.assertGreater(len(payload["edit_proposals"]), 0)
+
+            proposal = payload["write_proposal"]
+            self.assertIn("Proposed Edits", proposal["proposed_content"])
+            self.assertIn("cli.py", proposal["pr_draft"])
+            self.assertIn("edit_proposals", proposal)
+
+    def test_existing_edit_proposals_are_preserved(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload = build_artifact(repo=temp_dir, issue=None, dry_run=True, approve_write=False)
+            payload["edit_proposals"] = [
+                {
+                    "path": "custom/file.py",
+                    "description": "LLM-generated edit",
+                    "original_snippet": "old code",
+                    "proposed_snippet": "new code",
+                }
+            ]
+            proposals = build_edit_proposals(payload)
+
+            self.assertEqual(len(proposals), 1)
+            self.assertEqual(proposals[0]["path"], "custom/file.py")
+
+    def test_patch_diff_reflects_edit_proposals(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            payload = _make_payload_with_context(temp_dir)
+            payload = prepare_write_action(payload)
+
+            patch_diff = payload["write_proposal"]["patch_diff"]
+            self.assertIn("---", patch_diff)
+            self.assertIn("+++", patch_diff)
