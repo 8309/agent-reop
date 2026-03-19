@@ -17,6 +17,8 @@ build/
 .vscode/
 .claude/
 runs/
+repoops-output/
+docs/*.png
 .codex/tmp/
 .codex/sessions/
 .codex/*.local.toml

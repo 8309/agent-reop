@@ -295,6 +295,59 @@ def _build_patch_diff_for_edits(edit_proposals: list[FileEditProposal]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Backup / rollback for retry loops
+# ---------------------------------------------------------------------------
+
+def backup_repo_files(repo_root: str, proposals: list[FileEditProposal]) -> dict[str, str]:
+    """Snapshot the current content of files that will be edited.
+
+    Returns a mapping ``{relative_path: original_content}`` that can be
+    passed to :func:`rollback_repo_files` to restore the files.
+    """
+    backups: dict[str, str] = {}
+    for ep in proposals:
+        file_path = Path(repo_root) / ep["path"]
+        if file_path.exists() and file_path.is_file():
+            backups[ep["path"]] = file_path.read_text(encoding="utf-8")
+    return backups
+
+
+def rollback_repo_files(repo_root: str, backups: dict[str, str]) -> None:
+    """Restore files to their backed-up content."""
+    for rel_path, content in backups.items():
+        file_path = Path(repo_root) / rel_path
+        file_path.write_text(content, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Apply edits to real files
+# ---------------------------------------------------------------------------
+
+def apply_edit_to_file(repo_root: str, proposal: FileEditProposal) -> bool:
+    """Apply a single edit proposal to a real repository file.
+
+    Replaces the first occurrence of ``original_snippet`` with
+    ``proposed_snippet``.  Returns ``True`` if the replacement was made,
+    ``False`` if the file does not exist or the snippet was not found.
+    """
+    file_path = Path(repo_root) / proposal["path"]
+    if not file_path.exists() or not file_path.is_file():
+        return False
+
+    original = proposal["original_snippet"]
+    if not original:
+        return False
+
+    content = file_path.read_text(encoding="utf-8")
+    if original not in content:
+        return False
+
+    new_content = content.replace(original, proposal["proposed_snippet"], 1)
+    file_path.write_text(new_content, encoding="utf-8")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Prepare / apply
 # ---------------------------------------------------------------------------
 
@@ -342,10 +395,25 @@ def apply_write_action(payload: dict[str, object]) -> dict[str, object]:
     if not proposal:
         raise RuntimeError("Write proposal must be prepared before applying write actions")
 
+    repo_root = str(payload["repo"])
+    applied: list[str] = []
+    failed_edits: list[dict[str, str]] = []
+
+    # Apply code edits to real repo files.
+    for ep in _get_edit_proposals(payload):
+        if apply_edit_to_file(repo_root, ep):
+            applied.append(str((Path(repo_root) / ep["path"]).resolve()))
+        else:
+            failed_edits.append({"path": ep["path"], "reason": "snippet not found in file"})
+
+    # Write the handoff document.
     target_path = Path(proposal["target_path"])
     target_path.parent.mkdir(parents=True, exist_ok=True)
     target_path.write_text(proposal["proposed_content"], encoding="utf-8")
+    applied.append(str(target_path.resolve()))
 
-    payload["applied_writes"] = [str(target_path.resolve())]
+    payload["applied_writes"] = applied
+    if failed_edits:
+        payload["failed_edits"] = failed_edits
     payload["write_status"] = "applied"
     return payload

@@ -1,0 +1,48 @@
+flowchart TD
+    A[读取 issue.md] --> B[扫描目标仓库<br/>collect_repo_context]
+    B --> C[LLM Step 1: 生成计划<br/>PlanDraftModel]
+    C --> D[LLM Step 2: 生成代码编辑<br/>EditPlanModel]
+    D --> E{approve-write?}
+
+    E -->|No| F[blocked-awaiting-approval]
+    E -->|dry-run| G[dry-run-proposed]
+    E -->|Yes| H[backup_repo_files<br/>快照原始文件]
+
+    H --> I[apply_write_action<br/>exact string replace]
+    I --> J[run_validation<br/>make test in target repo]
+    J --> K{test passed?}
+
+    K -->|Yes| L[persist_run_artifacts]
+    K -->|No| M{retry < 2?}
+
+    M -->|No| L
+    M -->|Yes| N[rollback_repo_files<br/>恢复原始文件]
+    N --> O[LLM Retry: 带 test output<br/>重新生成 edit proposals]
+    O --> P[prepare_write_action<br/>更新 payload]
+    P --> H
+
+    L --> Q[输出 artifacts]
+    Q --> R[plan.json]
+    Q --> S[patch.diff]
+    Q --> T[pr_draft.md]
+    Q --> U[test_report.json]
+
+    subgraph Providers
+        direction LR
+        P1[deterministic]
+        P2[gemini-cli]
+        P3[claude-code-cli]
+        P4[codex-cli]
+    end
+
+    C -.-> Providers
+    D -.-> Providers
+    O -.-> Providers
+
+    subgraph RepoScan[repo scan]
+        B1[list_files]
+        B2[read_file]
+        B3[code_search]
+    end
+
+    B -.-> RepoScan

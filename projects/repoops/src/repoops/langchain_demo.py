@@ -12,11 +12,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from portfolio_shared.repoops_contracts import build_plan_outline, build_repoops_run, parse_issue_markdown
 from repoops.claude_code_cli_provider import ClaudeCodeCLIProvider
-from repoops.cli import load_issue_text, persist_run_artifacts
+from repoops.cli import load_issue_text, persist_run_artifacts, run_validation
 from repoops.codex_cli_provider import CodexCLIProvider
 from repoops.gemini_cli_provider import GeminiCLIProvider
 from repoops.read_only_tools import collect_repo_context, read_file_content
-from repoops.write_actions import apply_write_action, prepare_write_action
+from repoops.write_actions import (
+    apply_write_action,
+    backup_repo_files,
+    prepare_write_action,
+    rollback_repo_files,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -327,10 +332,18 @@ PLAN_PROMPT_TEMPLATE = (
 EDIT_PROMPT_TEMPLATE = (
     "You are a RepoOps code editor.\n"
     "Given the issue, plan, and full file contents below, propose concrete code edits.\n\n"
+    "CRITICAL RULES:\n"
+    "- `original_snippet` must be copied VERBATIM from the file contents below.\n"
+    "  Include type annotations, docstrings, comments, and whitespace exactly as they appear.\n"
+    "  The snippet will be used for exact string matching — even one wrong character will fail.\n"
+    "- `proposed_snippet` is the replacement code that will substitute the original.\n"
+    "- Keep snippets minimal: only include the lines that change plus enough surrounding\n"
+    "  context (1-2 lines) to make the match unique within the file.\n"
+    "- Do NOT invent code that is not in the file. Copy-paste from the file contents below.\n\n"
     "For each file that needs changing:\n"
-    "- Set `path` to the relative file path\n"
+    "- Set `path` to the relative file path (must match a path from the file contents section)\n"
     "- Set `description` to a short explanation of the change\n"
-    "- Set `original_snippet` to the exact lines from the file that need changing\n"
+    "- Set `original_snippet` to the exact verbatim lines from the file\n"
     "- Set `proposed_snippet` to your replacement code\n\n"
     "Only include files that actually need changes. Write real, working code.\n\n"
     "Issue:\n{issue_text}\n\n"
@@ -338,6 +351,57 @@ EDIT_PROMPT_TEMPLATE = (
     "File contents:\n{file_contents}\n\n"
     "Return JSON that matches this schema:\n{format_instructions}\n"
 )
+
+RETRY_EDIT_PROMPT_TEMPLATE = (
+    "You are a RepoOps code editor. Your previous edit attempt FAILED validation.\n\n"
+    "CRITICAL RULES:\n"
+    "- `original_snippet` must be copied VERBATIM from the file contents below.\n"
+    "  Include type annotations, docstrings, comments, and whitespace exactly as they appear.\n"
+    "  The snippet will be used for exact string matching — even one wrong character will fail.\n"
+    "- Keep snippets minimal: only include the lines that change plus enough surrounding\n"
+    "  context (1-2 lines) to make the match unique within the file.\n"
+    "- Do NOT invent code that is not in the file. Copy-paste from the file contents below.\n\n"
+    "Issue:\n{issue_text}\n\n"
+    "Plan:\n{plan_summary}\n\n"
+    "Your previous edit:\n{previous_edit}\n\n"
+    "Test output (FAILED):\n{test_output}\n\n"
+    "Current file contents (after rollback to original):\n{file_contents}\n\n"
+    "Analyze the test failure, fix your edits, and return corrected JSON.\n"
+    "Return JSON that matches this schema:\n{format_instructions}\n"
+)
+
+MAX_RETRIES = 2
+
+
+def retry_edit_proposals(
+    provider: str,
+    repo: str,
+    issue_text: str,
+    plan_summary: str,
+    previous_edit: str,
+    test_output: str,
+    repo_context: dict[str, object],
+    file_contents: dict[str, str],
+) -> list[FileEditModel]:
+    """Re-invoke the LLM with test failure context to get corrected edits."""
+    edit_parser = PydanticOutputParser(pydantic_object=EditPlanModel)
+    retry_prompt = PromptTemplate.from_template(RETRY_EDIT_PROMPT_TEMPLATE)
+    retry_input = {
+        "issue_text": issue_text,
+        "plan_summary": plan_summary,
+        "previous_edit": previous_edit,
+        "test_output": test_output,
+        "file_contents": format_file_contents_for_prompt(file_contents),
+        "format_instructions": edit_parser.get_format_instructions(),
+    }
+
+    edit_model, _ = build_edit_runnable(
+        provider=provider, repo=repo, issue_text=issue_text,
+        repo_context=repo_context, file_contents=file_contents,
+    )
+    retry_chain = retry_prompt | edit_model | edit_parser
+    edit_plan: EditPlanModel = retry_chain.invoke(retry_input)
+    return edit_plan.edit_proposals
 
 
 def build_learning_chain(
@@ -462,15 +526,86 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Issue file does not exist: {args.issue}", file=sys.stderr)
         return 1
 
+    repo = str(repo_path.resolve())
+    issue = str(Path(args.issue).resolve()) if args.issue else None
+
     payload = build_langchain_artifact(
-        repo=str(repo_path.resolve()),
-        issue=str(Path(args.issue).resolve()) if args.issue else None,
+        repo=repo,
+        issue=issue,
         dry_run=args.dry_run,
         approve_write=args.approve_write,
         provider=args.provider,
     )
     payload = prepare_write_action(payload)
-    payload = apply_write_action(payload)
+
+    # --- Closed-loop: apply → validate → retry on failure ---
+    can_retry = (
+        args.provider != "deterministic"
+        and not args.dry_run
+        and args.approve_write
+    )
+    repo_context = payload.get("repo_context", {})
+    issue_text = str(payload.get("issue_text", ""))
+    plan_summary = "\n".join(
+        f"- {s['step_id']}: {s['description']}"
+        for s in payload.get("plan_outline", [])
+        if isinstance(s, dict)
+    )
+    retry_history: list[dict[str, object]] = []
+
+    for attempt in range(1 + MAX_RETRIES):
+        # Backup files before applying edits so we can rollback.
+        edit_proposals = payload.get("edit_proposals", [])
+        backups = backup_repo_files(repo, edit_proposals) if can_retry else {}
+
+        payload = apply_write_action(payload)
+        payload = run_validation(payload)
+
+        test_report = payload.get("test_report", {})
+        passed = test_report.get("passed", False) if isinstance(test_report, dict) else False
+
+        if passed or not can_retry or attempt == MAX_RETRIES:
+            break
+
+        # --- Retry: rollback, re-generate edits, update payload ---
+        print(
+            f"[retry {attempt + 1}/{MAX_RETRIES}] Validation failed, "
+            f"rolling back and asking LLM for corrected edits...",
+            file=sys.stderr,
+        )
+        rollback_repo_files(repo, backups)
+
+        previous_edit = json.dumps(edit_proposals, indent=2)
+        test_stdout = test_report.get("stdout", "") if isinstance(test_report, dict) else ""
+        test_stderr = test_report.get("stderr", "") if isinstance(test_report, dict) else ""
+        test_output = f"STDOUT:\n{test_stdout}\n\nSTDERR:\n{test_stderr}"
+
+        retry_history.append({
+            "attempt": attempt + 1,
+            "edit_proposals": edit_proposals,
+            "test_report": test_report,
+        })
+
+        # Re-read file contents after rollback for accurate context.
+        file_contents = collect_edit_context(repo, repo_context)
+        new_edits = retry_edit_proposals(
+            provider=args.provider,
+            repo=repo,
+            issue_text=issue_text,
+            plan_summary=plan_summary,
+            previous_edit=previous_edit,
+            test_output=test_output,
+            repo_context=repo_context,
+            file_contents=file_contents,
+        )
+
+        # Patch payload with new edit proposals and re-prepare.
+        payload["edit_proposals"] = [ep.model_dump() for ep in new_edits]
+        payload = prepare_write_action(payload)
+
+    if retry_history:
+        payload["retry_history"] = retry_history
+
     payload = persist_run_artifacts(payload)
     print(json.dumps(payload, indent=2))
     return 0

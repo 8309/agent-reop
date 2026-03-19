@@ -5,6 +5,7 @@ import unittest
 
 from repoops.cli import build_artifact, persist_run_artifacts
 from repoops.write_actions import (
+    apply_edit_to_file,
     apply_write_action,
     build_edit_proposals,
     prepare_write_action,
@@ -145,3 +146,67 @@ class WriteActionsTest(unittest.TestCase):
             patch_diff = payload["write_proposal"]["patch_diff"]
             self.assertIn("---", patch_diff)
             self.assertIn("+++", patch_diff)
+
+    def test_apply_edit_to_file_replaces_snippet(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "app.py"
+            target.write_text("def greet():\n    return 'hello'\n", encoding="utf-8")
+
+            proposal = {
+                "path": "app.py",
+                "description": "update greeting",
+                "original_snippet": "return 'hello'",
+                "proposed_snippet": "return 'hello world'",
+            }
+            result = apply_edit_to_file(temp_dir, proposal)
+
+            self.assertTrue(result)
+            self.assertIn("return 'hello world'", target.read_text(encoding="utf-8"))
+
+    def test_apply_edit_to_file_returns_false_when_snippet_not_found(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "app.py").write_text("pass\n", encoding="utf-8")
+
+            proposal = {
+                "path": "app.py",
+                "description": "no match",
+                "original_snippet": "nonexistent code",
+                "proposed_snippet": "replacement",
+            }
+            self.assertFalse(apply_edit_to_file(temp_dir, proposal))
+
+    def test_apply_edit_to_file_returns_false_for_missing_file(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            proposal = {
+                "path": "missing.py",
+                "description": "no file",
+                "original_snippet": "x",
+                "proposed_snippet": "y",
+            }
+            self.assertFalse(apply_edit_to_file(temp_dir, proposal))
+
+    def test_apply_write_action_applies_code_edits_when_approved(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            target = root / "src" / "main.py"
+            target.parent.mkdir(parents=True)
+            target.write_text("x = 1\ny = 2\n", encoding="utf-8")
+
+            payload = build_artifact(repo=temp_dir, issue=None, dry_run=False, approve_write=True)
+            # Inject a concrete edit proposal that matches the file content.
+            payload["edit_proposals"] = [
+                {
+                    "path": "src/main.py",
+                    "description": "change x",
+                    "original_snippet": "x = 1",
+                    "proposed_snippet": "x = 42",
+                }
+            ]
+            payload = prepare_write_action(payload)
+            payload = apply_write_action(payload)
+
+            self.assertEqual(payload["write_status"], "applied")
+            self.assertIn(str(target.resolve()), payload["applied_writes"])
+            self.assertIn("x = 42", target.read_text(encoding="utf-8"))

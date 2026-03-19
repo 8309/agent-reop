@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from portfolio_shared.repoops_contracts import build_repoops_run
 from repoops.read_only_tools import collect_repo_context
 from repoops.write_actions import apply_write_action, prepare_write_action
+
+
+DEFAULT_VALIDATION_COMMAND = ["make", "test"]
 
 
 def load_issue_text(issue: str | None) -> str:
@@ -29,6 +34,63 @@ def build_artifact(repo: str, issue: str | None, dry_run: bool, approve_write: b
     )
 
 
+def run_validation(
+    payload: dict[str, object],
+    command: list[str] | None = None,
+    timeout: int = 120,
+) -> dict[str, object]:
+    """Run a validation command and store the result in the payload.
+
+    The test report is stored under ``payload["test_report"]`` with fields:
+    command, exit_code, passed, stdout (truncated), stderr (truncated),
+    and duration_seconds.
+    """
+    cmd = command or DEFAULT_VALIDATION_COMMAND
+    repo = str(payload.get("repo", "."))
+    start = time.monotonic()
+
+    try:
+        completed = subprocess.run(
+            cmd,
+            cwd=repo,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+        duration = round(time.monotonic() - start, 2)
+        payload["test_report"] = {
+            "command": cmd,
+            "exit_code": completed.returncode,
+            "passed": completed.returncode == 0,
+            "stdout": completed.stdout[-2000:] if completed.stdout else "",
+            "stderr": completed.stderr[-2000:] if completed.stderr else "",
+            "duration_seconds": duration,
+        }
+    except FileNotFoundError:
+        duration = round(time.monotonic() - start, 2)
+        payload["test_report"] = {
+            "command": cmd,
+            "exit_code": -1,
+            "passed": False,
+            "stdout": "",
+            "stderr": f"Command not found: {cmd[0]}",
+            "duration_seconds": duration,
+        }
+    except subprocess.TimeoutExpired:
+        duration = round(time.monotonic() - start, 2)
+        payload["test_report"] = {
+            "command": cmd,
+            "exit_code": -1,
+            "passed": False,
+            "stdout": "",
+            "stderr": f"Command timed out after {timeout}s",
+            "duration_seconds": duration,
+        }
+
+    return payload
+
+
 def persist_run_artifacts(payload: dict[str, object]) -> dict[str, object]:
     run_dir = Path(str(payload["run_dir"]))
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -40,6 +102,10 @@ def persist_run_artifacts(payload: dict[str, object]) -> dict[str, object]:
     if proposal:
         artifact_contents["patch.diff"] = str(proposal.get("patch_diff", ""))
         artifact_contents["pr_draft.md"] = str(proposal.get("pr_draft", ""))
+
+    test_report = payload.get("test_report")
+    if test_report:
+        artifact_contents["test_report.json"] = json.dumps(test_report, indent=2) + "\n"
 
     persisted_artifacts = list(payload.get("persisted_artifacts", []))
     for artifact_name in artifact_contents:
@@ -89,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     payload = prepare_write_action(payload)
     payload = apply_write_action(payload)
+    payload = run_validation(payload)
     # Keep file writes at the CLI boundary so the shared payload builder stays side-effect free.
     payload = persist_run_artifacts(payload)
     print(json.dumps(payload, indent=2))
