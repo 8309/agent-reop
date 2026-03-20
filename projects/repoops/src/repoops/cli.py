@@ -15,6 +15,41 @@ from repoops.write_actions import apply_write_action, prepare_write_action
 DEFAULT_VALIDATION_COMMAND = ["make", "test"]
 
 
+def detect_validation_command(repo_root: str) -> list[str]:
+    """Auto-detect the test/validation command for a target repository.
+
+    Inspects common project files to determine the appropriate test command.
+    Falls back to ``make test`` if nothing specific is detected.
+    """
+    root = Path(repo_root)
+
+    # Check Makefile for a "test" target.
+    makefile = root / "Makefile"
+    if makefile.exists():
+        content = makefile.read_text(encoding="utf-8", errors="replace")
+        if "test:" in content or "test :" in content:
+            return ["make", "test"]
+
+    # Python: pyproject.toml or setup.py → pytest
+    if (root / "pyproject.toml").exists() or (root / "setup.py").exists():
+        return ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
+
+    # Node.js: package.json → npm test
+    package_json = root / "package.json"
+    if package_json.exists():
+        return ["npm", "test"]
+
+    # Rust: Cargo.toml → cargo test
+    if (root / "Cargo.toml").exists():
+        return ["cargo", "test"]
+
+    # Go: go.mod → go test
+    if (root / "go.mod").exists():
+        return ["go", "test", "./..."]
+
+    return DEFAULT_VALIDATION_COMMAND
+
+
 def load_issue_text(issue: str | None) -> str:
     if issue is None:
         return "# Untitled Issue\n\nNo issue text provided."
@@ -30,7 +65,7 @@ def build_artifact(repo: str, issue: str | None, dry_run: bool, approve_write: b
         issue_text=issue_text,
         dry_run=dry_run,
         approve_write=approve_write,
-        repo_context=collect_repo_context(repo),
+        repo_context=collect_repo_context(repo, issue_text=issue_text),
     )
 
 
@@ -155,7 +190,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     payload = prepare_write_action(payload)
     payload = apply_write_action(payload)
-    payload = run_validation(payload)
+    validation_cmd = detect_validation_command(str(repo_path.resolve()))
+    payload = run_validation(payload, command=validation_cmd)
     # Keep file writes at the CLI boundary so the shared payload builder stays side-effect free.
     payload = persist_run_artifacts(payload)
     print(json.dumps(payload, indent=2))

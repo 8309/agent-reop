@@ -27,10 +27,8 @@ Acceptance criteria:
 def _make_payload_with_context(temp_dir: str) -> dict[str, object]:
     """Build a payload against a temp repo that has enough files to trigger edit proposals."""
     root = Path(temp_dir)
-    (root / "README.md").write_text("# Demo\n\nplan.json appears here.\n", encoding="utf-8")
-    src = root / "projects/repoops/src/repoops"
-    src.mkdir(parents=True)
-    (src / "cli.py").write_text(
+    (root / "README.md").write_text("# Demo\n", encoding="utf-8")
+    (root / "cli.py").write_text(
         "def persist_run_artifacts():\n    approve_write = False\n",
         encoding="utf-8",
     )
@@ -161,10 +159,10 @@ class WriteActionsTest(unittest.TestCase):
             }
             result = apply_edit_to_file(temp_dir, proposal)
 
-            self.assertTrue(result)
+            self.assertTrue(result.success)
             self.assertIn("return 'hello world'", target.read_text(encoding="utf-8"))
 
-    def test_apply_edit_to_file_returns_false_when_snippet_not_found(self) -> None:
+    def test_apply_edit_to_file_returns_failure_when_snippet_not_found(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             (root / "app.py").write_text("pass\n", encoding="utf-8")
@@ -175,9 +173,12 @@ class WriteActionsTest(unittest.TestCase):
                 "original_snippet": "nonexistent code",
                 "proposed_snippet": "replacement",
             }
-            self.assertFalse(apply_edit_to_file(temp_dir, proposal))
+            result = apply_edit_to_file(temp_dir, proposal)
+            self.assertFalse(result.success)
+            self.assertEqual(result.reason, "snippet not found in file")
+            self.assertIn("not found in file", result.detail)
 
-    def test_apply_edit_to_file_returns_false_for_missing_file(self) -> None:
+    def test_apply_edit_to_file_returns_failure_for_missing_file(self) -> None:
         with TemporaryDirectory() as temp_dir:
             proposal = {
                 "path": "missing.py",
@@ -185,7 +186,42 @@ class WriteActionsTest(unittest.TestCase):
                 "original_snippet": "x",
                 "proposed_snippet": "y",
             }
-            self.assertFalse(apply_edit_to_file(temp_dir, proposal))
+            result = apply_edit_to_file(temp_dir, proposal)
+            self.assertFalse(result.success)
+            self.assertEqual(result.reason, "file not found")
+
+    def test_apply_edit_diagnoses_indentation_mismatch(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            # File has "    my_unique_var = 1", snippet omits leading spaces.
+            # "my_unique_var" won't appear without indentation anywhere else.
+            (root / "app.py").write_text("    my_unique_var = 1\n", encoding="utf-8")
+
+            proposal = {
+                "path": "app.py",
+                "description": "indent issue",
+                "original_snippet": "my_unique_var = 1\nsome_other_line",
+                "proposed_snippet": "my_unique_var = 2",
+            }
+            result = apply_edit_to_file(temp_dir, proposal)
+            self.assertFalse(result.success)
+            # Diagnosis should mention the mismatch at line 2
+            self.assertIn("snippet not found", result.reason)
+
+    def test_apply_edit_diagnoses_non_contiguous_lines(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "app.py").write_text("x = 1\nz = 3\ny = 2\n", encoding="utf-8")
+
+            proposal = {
+                "path": "app.py",
+                "description": "reorder",
+                "original_snippet": "x = 1\ny = 2",
+                "proposed_snippet": "x = 1\ny = 2",
+            }
+            result = apply_edit_to_file(temp_dir, proposal)
+            self.assertFalse(result.success)
+            self.assertIn("contiguous", result.detail)
 
     def test_apply_write_action_applies_code_edits_when_approved(self) -> None:
         with TemporaryDirectory() as temp_dir:

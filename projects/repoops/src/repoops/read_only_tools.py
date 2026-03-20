@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -17,17 +18,40 @@ IGNORED_DIR_NAMES = {
     "runs",
 }
 
-DEFAULT_KEY_FILES = (
+# Common project files to look for (language-agnostic).
+# collect_repo_context will pick whichever exist in the target repo.
+WELL_KNOWN_PROJECT_FILES = (
     "README.md",
+    "README.rst",
     "Makefile",
-    "projects/repoops/src/repoops/cli.py",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+    "pom.xml",
+    "build.gradle",
+    "CMakeLists.txt",
 )
 
-DEFAULT_SEARCH_PATTERNS = (
-    "plan.json",
-    "approve_write",
-    "persist_run_artifacts",
-)
+# Stop-words excluded when extracting search keywords from issue text.
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "shall",
+    "should", "may", "might", "must", "can", "could", "and", "but", "or",
+    "nor", "not", "so", "yet", "for", "at", "by", "to", "in", "on", "of",
+    "if", "then", "else", "when", "from", "with", "that", "this", "it",
+    "its", "into", "also", "each", "all", "any", "both", "such", "than",
+    "too", "very", "just", "about", "above", "after", "before", "between",
+    "more", "most", "other", "some", "only", "same", "here", "there",
+    "what", "which", "who", "whom", "how", "where", "why",
+    # domain filler
+    "should", "must", "need", "needs", "make", "ensure", "add", "remove",
+    "update", "change", "fix", "bug", "feature", "issue", "error",
+    "implement", "implementation", "currently", "instead", "return",
+    "returns", "raise", "raises", "handle", "test", "tests",
+})
 
 
 def _resolve_repo_root(repo_root: str | Path) -> Path:
@@ -118,15 +142,55 @@ def code_search(repo_root: str | Path, pattern: str, max_results: int = 10) -> l
     return matches
 
 
-def collect_repo_context(repo_root: str | Path) -> dict[str, object]:
-    root = _resolve_repo_root(repo_root)
-    key_file_previews: list[dict[str, object]] = []
-    for relative_path in DEFAULT_KEY_FILES:
-        if (root / relative_path).exists():
-            key_file_previews.append(read_file(root, relative_path, max_lines=12))
+def detect_key_files(repo_root: Path) -> list[str]:
+    """Auto-detect key project files that exist in the target repo."""
+    found: list[str] = []
+    for name in WELL_KNOWN_PROJECT_FILES:
+        if (repo_root / name).exists():
+            found.append(name)
+    return found
 
+
+def extract_search_keywords(issue_text: str, max_keywords: int = 6) -> list[str]:
+    """Extract meaningful search keywords from issue text.
+
+    Splits on non-alphanumeric/underscore boundaries, filters stop-words and
+    short tokens, then returns up to *max_keywords* unique terms ordered by
+    frequency (most common first).
+    """
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", issue_text)
+    freq: dict[str, int] = {}
+    for tok in tokens:
+        lower = tok.lower()
+        if lower in _STOP_WORDS or len(lower) <= 2:
+            continue
+        freq[lower] = freq.get(lower, 0) + 1
+    # Sort by frequency desc, then alphabetically for stability.
+    ranked = sorted(freq, key=lambda w: (-freq[w], w))
+    return ranked[:max_keywords]
+
+
+def collect_repo_context(
+    repo_root: str | Path,
+    issue_text: str | None = None,
+) -> dict[str, object]:
+    """Scan a target repository and return context for LLM prompts.
+
+    Key files are auto-detected from well-known project file names.
+    Search patterns are extracted from *issue_text* keywords when provided,
+    falling back to file-inventory-only mode when no issue is given.
+    """
+    root = _resolve_repo_root(repo_root)
+
+    # Auto-detect key files.
+    key_file_previews: list[dict[str, object]] = []
+    for relative_path in detect_key_files(root):
+        key_file_previews.append(read_file(root, relative_path, max_lines=12))
+
+    # Extract search keywords from issue text.
+    search_patterns = extract_search_keywords(issue_text) if issue_text else []
     search_results: list[dict[str, object]] = []
-    for pattern in DEFAULT_SEARCH_PATTERNS:
+    for pattern in search_patterns:
         matches = code_search(root, pattern, max_results=5)
         if matches:
             search_results.append({"pattern": pattern, "matches": matches})

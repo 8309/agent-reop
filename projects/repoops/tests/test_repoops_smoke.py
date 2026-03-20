@@ -3,7 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 
-from repoops.cli import build_artifact, persist_run_artifacts, run_validation
+from repoops.cli import build_artifact, detect_validation_command, persist_run_artifacts, run_validation
 
 
 class RepoOpsSmokeTest(unittest.TestCase):
@@ -36,21 +36,16 @@ class RepoOpsSmokeTest(unittest.TestCase):
     def test_build_artifact_collects_repo_context(self) -> None:
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            (root / "README.md").write_text("# Demo Repo\n\nplan.json appears here.\n", encoding="utf-8")
-            (root / "Makefile").write_text("demo:\n\t@echo ok\n", encoding="utf-8")
-            source_dir = root / "projects/repoops/src/repoops"
-            source_dir.mkdir(parents=True)
-            (source_dir / "cli.py").write_text(
-                "def persist_run_artifacts():\n    approve_write = False\n",
-                encoding="utf-8",
-            )
+            (root / "README.md").write_text("# Demo Repo\n", encoding="utf-8")
+            (root / "Makefile").write_text("test:\n\t@echo ok\n", encoding="utf-8")
 
             payload = build_artifact(repo=temp_dir, issue=None, dry_run=True, approve_write=False)
 
             repo_context = payload["repo_context"]
             self.assertIn("README.md", repo_context["file_inventory"])
-            self.assertEqual(repo_context["key_file_previews"][0]["path"], "README.md")
-            self.assertEqual(repo_context["search_results"][0]["pattern"], "plan.json")
+            key_paths = [p["path"] for p in repo_context["key_file_previews"]]
+            self.assertIn("README.md", key_paths)
+            self.assertIn("Makefile", key_paths)
 
     def test_run_validation_captures_passing_command(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -108,3 +103,39 @@ class RepoOpsSmokeTest(unittest.TestCase):
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertTrue(report["passed"])
             self.assertIn("all passed", report["stdout"])
+
+    def test_detect_validation_command_makefile(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "Makefile").write_text("test:\n\tpytest\n", encoding="utf-8")
+            self.assertEqual(detect_validation_command(temp_dir), ["make", "test"])
+
+    def test_detect_validation_command_python(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+            cmd = detect_validation_command(temp_dir)
+            self.assertEqual(cmd[0], "python")
+            self.assertIn("pytest", cmd)
+
+    def test_detect_validation_command_node(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "package.json").write_text("{}\n", encoding="utf-8")
+            self.assertEqual(detect_validation_command(temp_dir), ["npm", "test"])
+
+    def test_detect_validation_command_rust(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "Cargo.toml").write_text("[package]\n", encoding="utf-8")
+            self.assertEqual(detect_validation_command(temp_dir), ["cargo", "test"])
+
+    def test_detect_validation_command_go(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "go.mod").write_text("module example\n", encoding="utf-8")
+            self.assertEqual(detect_validation_command(temp_dir), ["go", "test", "./..."])
+
+    def test_detect_validation_command_fallback(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            self.assertEqual(detect_validation_command(temp_dir), ["make", "test"])

@@ -67,7 +67,7 @@ class RepoOpsLangChainDemoTest(unittest.TestCase):
             # Deterministic edit proposals should include actual file content
             self.assertIn("approve_write", edit_proposals[0].original_snippet)
 
-    @patch("repoops.langchain_demo.CodexCLIProvider.invoke_json")
+    @patch("repoops.provider_registry.CodexCLIProvider.invoke_json")
     def test_build_learning_chain_supports_codex_cli_provider(self, mock_invoke_json: object) -> None:
         # First call returns plan, second call returns edits
         mock_invoke_json.side_effect = [
@@ -86,7 +86,7 @@ class RepoOpsLangChainDemoTest(unittest.TestCase):
         self.assertEqual(plan.issue_title, "Sample Bug")
         self.assertIn("CodexCLIProvider", chain_steps)
 
-    @patch("repoops.langchain_demo.ClaudeCodeCLIProvider.invoke_json")
+    @patch("repoops.provider_registry.ClaudeCodeCLIProvider.invoke_json")
     def test_build_learning_chain_supports_claude_code_cli_provider(self, mock_invoke_json: object) -> None:
         mock_invoke_json.side_effect = [
             build_demo_planner_response(ISSUE_TEXT),
@@ -104,7 +104,7 @@ class RepoOpsLangChainDemoTest(unittest.TestCase):
         self.assertEqual(plan.issue_title, "Sample Bug")
         self.assertIn("ClaudeCodeCLIProvider", chain_steps)
 
-    @patch("repoops.langchain_demo.GeminiCLIProvider.invoke_json")
+    @patch("repoops.provider_registry.GeminiCLIProvider.invoke_json")
     def test_build_learning_chain_supports_gemini_cli_provider(self, mock_invoke_json: object) -> None:
         mock_invoke_json.side_effect = [
             build_demo_planner_response(ISSUE_TEXT),

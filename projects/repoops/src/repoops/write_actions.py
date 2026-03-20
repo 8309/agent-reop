@@ -323,28 +323,73 @@ def rollback_repo_files(repo_root: str, backups: dict[str, str]) -> None:
 # Apply edits to real files
 # ---------------------------------------------------------------------------
 
-def apply_edit_to_file(repo_root: str, proposal: FileEditProposal) -> bool:
+class EditResult:
+    """Result of applying a single edit proposal."""
+
+    __slots__ = ("success", "reason", "detail")
+
+    def __init__(self, success: bool, reason: str = "", detail: str = "") -> None:
+        self.success = success
+        self.reason = reason
+        self.detail = detail
+
+    def to_dict(self) -> dict[str, str]:
+        d: dict[str, str] = {"reason": self.reason}
+        if self.detail:
+            d["detail"] = self.detail
+        return d
+
+
+def _diagnose_snippet_mismatch(content: str, snippet: str) -> str:
+    """Produce a human-readable hint about why *snippet* wasn't found in *content*."""
+    lines_snippet = snippet.splitlines()
+    if not lines_snippet:
+        return "original_snippet is empty"
+
+    # Check if the first line exists (common case: LLM altered later lines).
+    first_line = lines_snippet[0]
+    if first_line not in content:
+        # Try stripping whitespace to detect indentation mismatch.
+        stripped = first_line.strip()
+        if stripped and stripped in content:
+            return (
+                f"First line found with different indentation. "
+                f"Expected: {first_line!r}"
+            )
+        return f"First line of snippet not found in file: {first_line!r}"
+
+    # First line matches — check subsequent lines.
+    for i, line in enumerate(lines_snippet[1:], start=2):
+        if line not in content:
+            return f"Mismatch starting at snippet line {i}: {line!r}"
+
+    # All lines exist individually but not as a contiguous block.
+    return "All snippet lines exist individually but not as a contiguous block (ordering/context differs)"
+
+
+def apply_edit_to_file(repo_root: str, proposal: FileEditProposal) -> EditResult:
     """Apply a single edit proposal to a real repository file.
 
     Replaces the first occurrence of ``original_snippet`` with
-    ``proposed_snippet``.  Returns ``True`` if the replacement was made,
-    ``False`` if the file does not exist or the snippet was not found.
+    ``proposed_snippet``.  Returns an :class:`EditResult` indicating
+    success or failure with diagnostic details.
     """
     file_path = Path(repo_root) / proposal["path"]
     if not file_path.exists() or not file_path.is_file():
-        return False
+        return EditResult(False, "file not found", str(file_path))
 
     original = proposal["original_snippet"]
     if not original:
-        return False
+        return EditResult(False, "empty original_snippet")
 
     content = file_path.read_text(encoding="utf-8")
     if original not in content:
-        return False
+        detail = _diagnose_snippet_mismatch(content, original)
+        return EditResult(False, "snippet not found in file", detail)
 
     new_content = content.replace(original, proposal["proposed_snippet"], 1)
     file_path.write_text(new_content, encoding="utf-8")
-    return True
+    return EditResult(True)
 
 
 # ---------------------------------------------------------------------------
@@ -401,10 +446,11 @@ def apply_write_action(payload: dict[str, object]) -> dict[str, object]:
 
     # Apply code edits to real repo files.
     for ep in _get_edit_proposals(payload):
-        if apply_edit_to_file(repo_root, ep):
+        result = apply_edit_to_file(repo_root, ep)
+        if result.success:
             applied.append(str((Path(repo_root) / ep["path"]).resolve()))
         else:
-            failed_edits.append({"path": ep["path"], "reason": "snippet not found in file"})
+            failed_edits.append({"path": ep["path"], **result.to_dict()})
 
     # Write the handoff document.
     target_path = Path(proposal["target_path"])

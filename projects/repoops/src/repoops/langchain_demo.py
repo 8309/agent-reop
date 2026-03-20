@@ -11,10 +11,8 @@ from langchain_core.runnables import RunnableLambda
 from pydantic import BaseModel, ConfigDict, Field
 
 from portfolio_shared.repoops_contracts import build_plan_outline, build_repoops_run, parse_issue_markdown
-from repoops.claude_code_cli_provider import ClaudeCodeCLIProvider
-from repoops.cli import load_issue_text, persist_run_artifacts, run_validation
-from repoops.codex_cli_provider import CodexCLIProvider
-from repoops.gemini_cli_provider import GeminiCLIProvider
+from repoops.cli import detect_validation_command, load_issue_text, persist_run_artifacts, run_validation
+from repoops.provider_registry import build_llm_runnable, is_llm_provider, list_providers
 from repoops.read_only_tools import collect_repo_context, read_file_content
 from repoops.write_actions import (
     apply_write_action,
@@ -199,52 +197,10 @@ def build_planner_runnable(
             ["PromptTemplate", "RunnableLambda", "PydanticOutputParser"],
         )
 
-    if provider == "codex-cli":
-        codex_provider = CodexCLIProvider(repo)
-
-        def run_codex(prompt_value: object) -> str:
-            prompt_text = prompt_value.to_string() if hasattr(prompt_value, "to_string") else str(prompt_value)
-            return codex_provider.invoke_json(
-                prompt_text=prompt_text,
-                output_schema=PlanDraftModel.model_json_schema(),
-            )
-
-        return (
-            RunnableLambda(run_codex),
-            ["PromptTemplate", "CodexCLIProvider", "PydanticOutputParser"],
-        )
-
-    if provider == "claude-code-cli":
-        claude_provider = ClaudeCodeCLIProvider(repo)
-
-        def run_claude(prompt_value: object) -> str:
-            prompt_text = prompt_value.to_string() if hasattr(prompt_value, "to_string") else str(prompt_value)
-            return claude_provider.invoke_json(
-                prompt_text=prompt_text,
-                output_schema=PlanDraftModel.model_json_schema(),
-            )
-
-        return (
-            RunnableLambda(run_claude),
-            ["PromptTemplate", "ClaudeCodeCLIProvider", "PydanticOutputParser"],
-        )
-
-    if provider == "gemini-cli":
-        gemini_provider = GeminiCLIProvider(repo)
-
-        def run_gemini(prompt_value: object) -> str:
-            prompt_text = prompt_value.to_string() if hasattr(prompt_value, "to_string") else str(prompt_value)
-            return gemini_provider.invoke_json(
-                prompt_text=prompt_text,
-                output_schema=PlanDraftModel.model_json_schema(),
-            )
-
-        return (
-            RunnableLambda(run_gemini),
-            ["PromptTemplate", "GeminiCLIProvider", "PydanticOutputParser"],
-        )
-
-    raise ValueError(f"Unsupported provider: {provider}")
+    runnable, step_label = build_llm_runnable(
+        provider, repo, PlanDraftModel.model_json_schema(),
+    )
+    return runnable, ["PromptTemplate", step_label, "PydanticOutputParser"]
 
 
 # ---------------------------------------------------------------------------
@@ -268,52 +224,10 @@ def build_edit_runnable(
             ["EditPromptTemplate", "RunnableLambda", "PydanticOutputParser"],
         )
 
-    if provider == "codex-cli":
-        codex_provider = CodexCLIProvider(repo)
-
-        def run_codex_edit(prompt_value: object) -> str:
-            prompt_text = prompt_value.to_string() if hasattr(prompt_value, "to_string") else str(prompt_value)
-            return codex_provider.invoke_json(
-                prompt_text=prompt_text,
-                output_schema=EditPlanModel.model_json_schema(),
-            )
-
-        return (
-            RunnableLambda(run_codex_edit),
-            ["EditPromptTemplate", "CodexCLIProvider", "PydanticOutputParser"],
-        )
-
-    if provider == "claude-code-cli":
-        claude_provider = ClaudeCodeCLIProvider(repo)
-
-        def run_claude_edit(prompt_value: object) -> str:
-            prompt_text = prompt_value.to_string() if hasattr(prompt_value, "to_string") else str(prompt_value)
-            return claude_provider.invoke_json(
-                prompt_text=prompt_text,
-                output_schema=EditPlanModel.model_json_schema(),
-            )
-
-        return (
-            RunnableLambda(run_claude_edit),
-            ["EditPromptTemplate", "ClaudeCodeCLIProvider", "PydanticOutputParser"],
-        )
-
-    if provider == "gemini-cli":
-        gemini_provider = GeminiCLIProvider(repo)
-
-        def run_gemini_edit(prompt_value: object) -> str:
-            prompt_text = prompt_value.to_string() if hasattr(prompt_value, "to_string") else str(prompt_value)
-            return gemini_provider.invoke_json(
-                prompt_text=prompt_text,
-                output_schema=EditPlanModel.model_json_schema(),
-            )
-
-        return (
-            RunnableLambda(run_gemini_edit),
-            ["EditPromptTemplate", "GeminiCLIProvider", "PydanticOutputParser"],
-        )
-
-    raise ValueError(f"Unsupported provider: {provider}")
+    runnable, step_label = build_llm_runnable(
+        provider, repo, EditPlanModel.model_json_schema(),
+    )
+    return runnable, ["EditPromptTemplate", step_label, "PydanticOutputParser"]
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +378,7 @@ def build_langchain_artifact(
     provider: str = "deterministic",
 ) -> dict[str, object]:
     issue_text = load_issue_text(issue)
-    repo_context = collect_repo_context(repo)
+    repo_context = collect_repo_context(repo, issue_text=issue_text)
     prompt_preview, plan_draft, edit_proposals, chain_steps = build_learning_chain(
         repo=repo,
         issue_text=issue_text,
@@ -501,7 +415,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="Do not perform any writes")
     parser.add_argument(
         "--provider",
-        choices=("deterministic", "codex-cli", "claude-code-cli", "gemini-cli"),
+        choices=list_providers(),
         default="deterministic",
         help="Planner backend used inside the LangChain learning demo",
     )
@@ -540,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Closed-loop: apply → validate → retry on failure ---
     can_retry = (
-        args.provider != "deterministic"
+        is_llm_provider(args.provider)
         and not args.dry_run
         and args.approve_write
     )
@@ -551,6 +465,7 @@ def main(argv: list[str] | None = None) -> int:
         for s in payload.get("plan_outline", [])
         if isinstance(s, dict)
     )
+    validation_cmd = detect_validation_command(repo)
     retry_history: list[dict[str, object]] = []
 
     for attempt in range(1 + MAX_RETRIES):
@@ -559,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
         backups = backup_repo_files(repo, edit_proposals) if can_retry else {}
 
         payload = apply_write_action(payload)
-        payload = run_validation(payload)
+        payload = run_validation(payload, command=validation_cmd)
 
         test_report = payload.get("test_report", {})
         passed = test_report.get("passed", False) if isinstance(test_report, dict) else False
